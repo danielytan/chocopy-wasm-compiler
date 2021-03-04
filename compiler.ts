@@ -1,6 +1,7 @@
 import { Stmt, Expr, UniOp, BinOp, Type, Program, Literal, FunDef, VarInit, Class } from "./ast";
 import { NUM, BOOL, NONE } from "./utils";
 import * as BaseException from "./error";
+import { GlobalTypeEnv } from "./type-check";
 
 // https://learnxinyminutes.com/docs/wasm/
 
@@ -68,7 +69,7 @@ export function makeLocals(locals: Set<string>) : Array<string> {
 
 }
 
-export function compile(ast: Program<Type>, env: GlobalEnv) : CompileResult {
+export function compile(ast: Program<Type>, env: GlobalEnv, tenv: GlobalTypeEnv) : CompileResult {
   const withDefines = augmentEnv(env, ast);
 
   const definedVars : Set<string> = new Set(); //getLocals(ast);
@@ -77,13 +78,13 @@ export function compile(ast: Program<Type>, env: GlobalEnv) : CompileResult {
   const localDefines = makeLocals(definedVars);
   const funs : Array<string> = [];
   ast.funs.forEach(f => {
-    funs.push(codeGenDef(f, withDefines).join("\n"));
+    funs.push(codeGenDef(f, withDefines, tenv).join("\n"));
   });
-  const classes : Array<string> = ast.classes.map(cls => codeGenClass(cls, withDefines)).flat();
+  const classes : Array<string> = ast.classes.map(cls => codeGenClass(cls, withDefines, tenv)).flat();
   const allFuns = funs.concat(classes).join("\n\n");
   // const stmts = ast.filter((stmt) => stmt.tag !== "fun");
-  const inits = ast.inits.map(init => codeGenInit(init, withDefines)).flat();
-  const commandGroups = ast.stmts.map((stmt) => codeGenStmt(stmt, withDefines));
+  const inits = ast.inits.map(init => codeGenInit(init, withDefines, tenv)).flat();
+  const commandGroups = ast.stmts.map((stmt) => codeGenStmt(stmt, withDefines, tenv));
   const commands = localDefines.concat(inits.concat([].concat.apply([], commandGroups)));
   withDefines.locals.clear();
   return {
@@ -98,7 +99,7 @@ function envLookup(env : GlobalEnv, name : string) : number {
   return (env.globals.get(name) * 4); // 4-byte values
 }
 
-function codeGenStmt(stmt: Stmt<Type>, env: GlobalEnv) : Array<string> {
+function codeGenStmt(stmt: Stmt<Type>, env: GlobalEnv, tenv: GlobalTypeEnv) : Array<string> {
   switch(stmt.tag) {
     // case "fun":
     //   const definedVars = getLocals(stmt.body);
@@ -119,13 +120,13 @@ function codeGenStmt(stmt: Stmt<Type>, env: GlobalEnv) : Array<string> {
     //     (i32.const 0)
     //     (return))`];
     case "return":
-      var valStmts = codeGenExpr(stmt.value, env);
+      var valStmts = codeGenExpr(stmt.value, env, tenv);
       valStmts.push("return");
       return valStmts;
     case "assignment":
       throw new Error("Destructured assignment not implemented");  
     case "assign":
-      var valStmts = codeGenExpr(stmt.value, env);
+      var valStmts = codeGenExpr(stmt.value, env, tenv);
       if (env.locals.has(stmt.name)) {
         return valStmts.concat([`(local.set $${stmt.name})`]); 
       } else {
@@ -133,28 +134,28 @@ function codeGenStmt(stmt: Stmt<Type>, env: GlobalEnv) : Array<string> {
         return locationToStore.concat(valStmts).concat([`(i32.store)`]);
       }
     case "expr":
-      var exprStmts = codeGenExpr(stmt.expr, env);
+      var exprStmts = codeGenExpr(stmt.expr, env, tenv);
       return exprStmts.concat([`(local.set $$last)`]);
     case "if":
-      var condExpr = codeGenExpr(stmt.cond, env);
-      var thnStmts = stmt.thn.map(innerStmt => codeGenStmt(innerStmt, env)).flat();
-      var elsStmts = stmt.els.map(innerStmt => codeGenStmt(innerStmt, env)).flat();
+      var condExpr = codeGenExpr(stmt.cond, env, tenv);
+      var thnStmts = stmt.thn.map(innerStmt => codeGenStmt(innerStmt, env, tenv)).flat();
+      var elsStmts = stmt.els.map(innerStmt => codeGenStmt(innerStmt, env, tenv)).flat();
       return [`${condExpr.join("\n")} \n (if (then ${thnStmts.join("\n")}) (else ${elsStmts.join("\n")}))`]
     case "while":
-      var wcondExpr = codeGenExpr(stmt.cond, env);
-      var bodyStmts = stmt.body.map(innerStmt => codeGenStmt(innerStmt, env)).flat();
+      var wcondExpr = codeGenExpr(stmt.cond, env, tenv);
+      var bodyStmts = stmt.body.map(innerStmt => codeGenStmt(innerStmt, env, tenv)).flat();
       return [`(block (loop  ${bodyStmts.join("\n")} (br_if 0 ${wcondExpr.join("\n")}) (br 1) ))`];
     case "pass":
       return [];
     case "field-assign":
-      var objStmts = codeGenExpr(stmt.obj, env);
+      var objStmts = codeGenExpr(stmt.obj, env, tenv);
       var objTyp = stmt.obj.a;
       if(objTyp.tag !== "class") { // I don't think this error can happen
         throw new Error("Report this as a bug to the compiler developer, this shouldn't happen " + objTyp.tag);
       }
       var className = objTyp.name;
       var [offset, _] = env.classes.get(className).get(stmt.field);
-      var valStmts = codeGenExpr(stmt.value, env);
+      var valStmts = codeGenExpr(stmt.value, env, tenv);
       return [
         ...objStmts,
         `(i32.add (i32.const ${offset * 4}))`,
@@ -164,7 +165,7 @@ function codeGenStmt(stmt: Stmt<Type>, env: GlobalEnv) : Array<string> {
   }
 }
 
-function codeGenInit(init : VarInit<Type>, env : GlobalEnv) : Array<string> {
+function codeGenInit(init : VarInit<Type>, env : GlobalEnv, tenv: GlobalTypeEnv) : Array<string> {
   const value = codeGenLiteral(init.value);
   if (env.locals.has(init.name)) {
     return [...value, `(local.set $${init.name})`]; 
@@ -174,7 +175,7 @@ function codeGenInit(init : VarInit<Type>, env : GlobalEnv) : Array<string> {
   }
 }
 
-function codeGenDef(def : FunDef<Type>, env : GlobalEnv) : Array<string> {
+function codeGenDef(def : FunDef<Type>, env : GlobalEnv, tenv: GlobalTypeEnv) : Array<string> {
   var definedVars : Set<string> = new Set();
   def.inits.forEach(v => definedVars.add(v.name));
   definedVars.add("$last");
@@ -184,9 +185,9 @@ function codeGenDef(def : FunDef<Type>, env : GlobalEnv) : Array<string> {
 
   const localDefines = makeLocals(definedVars);
   const locals = localDefines.join("\n");
-  const inits = def.inits.map(init => codeGenInit(init, env)).flat().join("\n");
+  const inits = def.inits.map(init => codeGenInit(init, env, tenv)).flat().join("\n");
   var params = def.parameters.map(p => `(param $${p.name} i32)`).join(" ");
-  var stmts = def.body.map((innerStmt) => codeGenStmt(innerStmt, env)).flat();
+  var stmts = def.body.map((innerStmt) => codeGenStmt(innerStmt, env, tenv)).flat();
   var stmtsBody = stmts.join("\n");
   env.locals.clear();
   return [`(func $${def.name} ${params} (result i32)
@@ -197,18 +198,18 @@ function codeGenDef(def : FunDef<Type>, env : GlobalEnv) : Array<string> {
     (return))`];
 }
 
-function codeGenClass(cls : Class<Type>, env : GlobalEnv) : Array<string> {
+function codeGenClass(cls : Class<Type>, env : GlobalEnv, tenv: GlobalTypeEnv) : Array<string> {
   const methods = [...cls.methods];
   methods.forEach(method => method.name = `${cls.name}$${method.name}`);
-  const result = methods.map(method => codeGenDef(method, env));
+  const result = methods.map(method => codeGenDef(method, env, tenv));
   return result.flat();
 }
 
-function codeGenExpr(expr : Expr<Type>, env: GlobalEnv) : Array<string> {
+function codeGenExpr(expr : Expr<Type>, env: GlobalEnv, tenv: GlobalTypeEnv) : Array<string> {
   switch(expr.tag) {
     case "builtin1":
       const argTyp = expr.a;
-      const argStmts = codeGenExpr(expr.arg, env);
+      const argStmts = codeGenExpr(expr.arg, env, tenv);
       var callName = expr.name;
       if (expr.name === "print" && argTyp === NUM) {
         callName = "print_num";
@@ -219,8 +220,8 @@ function codeGenExpr(expr : Expr<Type>, env: GlobalEnv) : Array<string> {
       }
       return argStmts.concat([`(call $${callName})`]);
     case "builtin2":
-      const leftStmts = codeGenExpr(expr.left, env);
-      const rightStmts = codeGenExpr(expr.right, env);
+      const leftStmts = codeGenExpr(expr.left, env, tenv);
+      const rightStmts = codeGenExpr(expr.right, env, tenv);
       return [...leftStmts, ...rightStmts, `(call $${expr.name})`]
     case "literal":
       return codeGenLiteral(expr.value);
@@ -231,11 +232,11 @@ function codeGenExpr(expr : Expr<Type>, env: GlobalEnv) : Array<string> {
         return [`(i32.const ${envLookup(env, expr.name)})`, `(i32.load)`]
       }
     case "binop":
-      const lhsStmts = codeGenExpr(expr.left, env);
-      const rhsStmts = codeGenExpr(expr.right, env);
+      const lhsStmts = codeGenExpr(expr.left, env, tenv);
+      const rhsStmts = codeGenExpr(expr.right, env, tenv);
       return [...lhsStmts, ...rhsStmts, codeGenBinOp(expr.op)]
     case "uniop":
-      const exprStmts = codeGenExpr(expr.expr, env);
+      const exprStmts = codeGenExpr(expr.expr, env, tenv);
       switch(expr.op){
         case UniOp.Neg:
           return [`(i32.const 0)`, ...exprStmts, `(i32.sub)`];
@@ -243,7 +244,18 @@ function codeGenExpr(expr : Expr<Type>, env: GlobalEnv) : Array<string> {
           return [`(i32.const 0)`, ...exprStmts, `(i32.eq)`];
       }
     case "call":
-      var valStmts = expr.arguments.map((arg) => codeGenExpr(arg, env)).flat();
+      // to implement defaults, we need to check the number of args in call versus the number of args in funcdef
+      // do they match? if they don't, then we may have to get additional args from the funcdef
+      var funcArgs = tenv.functions.get(expr.name)[0];
+      var numArgsProvided = expr.arguments.length;
+      var numArgsOfFunc = funcArgs.length;
+      var valStmts = expr.arguments.map((arg) => codeGenExpr(arg, env, tenv)).flat();
+
+      if(numArgsProvided !== numArgsOfFunc){
+        var additionalArgs = funcArgs.slice(numArgsProvided);
+        valStmts = valStmts.concat(additionalArgs.map((param) => codeGenLiteral(param.value)).flat());
+      }
+
       valStmts.push(`(call $${expr.name})`);
       return valStmts;
     case "construct":
@@ -266,20 +278,20 @@ function codeGenExpr(expr : Expr<Type>, env: GlobalEnv) : Array<string> {
         "(drop)"
       ]);
     case "method-call":
-      var objStmts = codeGenExpr(expr.obj, env);
+      var objStmts = codeGenExpr(expr.obj, env, tenv);
       var objTyp = expr.obj.a;
       if(objTyp.tag !== "class") { // I don't think this error can happen
         throw new Error("Report this as a bug to the compiler developer, this shouldn't happen " + objTyp.tag);
       }
       var className = objTyp.name;
-      var argsStmts = expr.arguments.map((arg) => codeGenExpr(arg, env)).flat();
+      var argsStmts = expr.arguments.map((arg) => codeGenExpr(arg, env, tenv)).flat();
       return [
         ...objStmts,
         ...argsStmts,
         `(call $${className}$${expr.method})`
       ];
     case "lookup":
-      var objStmts = codeGenExpr(expr.obj, env);
+      var objStmts = codeGenExpr(expr.obj, env, tenv);
       var objTyp = expr.obj.a;
       if(objTyp.tag !== "class") { // I don't think this error can happen
         throw new Error("Report this as a bug to the compiler developer, this shouldn't happen " + objTyp.tag);

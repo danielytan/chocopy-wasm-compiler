@@ -56,7 +56,7 @@ export async function run(source : string, config: Config) : Promise<[Value, com
     returnExpr = "(local.get $$last)"
   } 
   let globalsBefore = (config.env.globals as Map<string, number>).size;
-  const compiled = compiler.compile(tprogram, config.env);
+  const compiled = compiler.compile(tprogram, config.env, tenv);
   let globalsAfter = compiled.newEnv.globals.size;
 
   const importObject = config.importObject;
